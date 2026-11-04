@@ -1,0 +1,96 @@
+What a LightningModule is
+
+PyTorch Lightning is a library that handles the routine parts of training, such as looping over batches, moving data to the GPU, running backpropagation, saving checkpoints, and using multiple GPUs. In exchange, you organize your code into a standard shape. A LightningModule is that shape: a regular PyTorch model class with a few named methods where you describe what one training step does and which optimizer to use. Lightning calls those methods at the right times.
+
+You write the recipe, and Lightning runs the kitchen. A separate object called the Trainer does the running:
+
+python
+trainer.fit(my_module, train_dataloader)
+
+That one line starts the loop. For each batch, Lightning calls your methods, and you never write the loop yourself.
+
+The methods you define
+Method	Called when	What you return
+__init__	Once, when you build the module	Nothing
+forward	When you call the module like a function (my_module(x))	Whatever you like
+training_step	Once per training batch	The loss (a single-number tensor)
+configure_optimizers	Once, at the start of training	The optimizer, and optionally a learning-rate scheduler
+validation_step	Once per validation batch	Optional (usually nothing, or a loss)
+__init__(self, ...)
+
+Here you create everything the module owns and store it as attributes: the model, any helper networks (like discriminators), loss functions, and settings. Call super().__init__() first. Anything you assign here that is a PyTorch module is automatically tracked for saving, moving to the GPU, and so on.
+
+forward(self, x)
+
+This defines how the model turns an input into an output. Lightning does not call it during training on its own. It’s there so you (and inference code) can use the module like a function. Many projects, including this repo’s wrappers, put the real logic inside training_step and use forward lightly or not at all.
+
+training_step(self, batch, batch_idx)
+
+This is the main method. Lightning gives you:
+
+batch: one batch exactly as your data loader produced it. In your case, that’s the audio batch plus the list of info dictionaries.
+batch_idx: a counter, which you often ignore.
+
+You do the work for one step: run the model, compute the error, and return the loss. Valid returns:
+
+a single-number tensor (the usual case)
+a dictionary with a "loss" key plus anything else you want to keep
+None, which tells Lightning to skip this batch
+
+After you return, Lightning automatically calls the backward pass (computing how to adjust each weight), takes the optimizer step (adjusting them), and clears the old gradients. You don’t write any of that. To record numbers for the logs, call self.log("train/loss", loss) inside the step. That sends it to whatever logger you set up (such as Weights & Biases).
+
+configure_optimizers(self)
+
+This tells Lightning how to update the weights. The simplest return is a single optimizer:
+
+python
+return torch.optim.AdamW(self.parameters(), lr=1e-4)
+
+You can also return a learning-rate scheduler (something that changes the learning rate over time). The most explicit form is a dictionary:
+
+python
+{"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+
+"interval": "step" means the scheduler updates every step. The default is every epoch, which is usually wrong for large data sets.
+
+validation_step(self, batch, batch_idx)
+
+Same shape as training_step, but Lightning runs it on held-out data, with the model in evaluation mode and without gradient tracking. You typically just log a number. Nothing is learned from it. Many projects skip it, and this repo may rely on demo callbacks instead.
+
+Optional hooks that matter in this repo
+
+Lightning offers many “hooks”: methods you can define that it calls at specific moments. These are the ones that likely appear in the wrappers you’ll read:
+
+on_train_batch_end(self, outputs, batch, batch_idx): runs after each step. Often used to update an EMA copy of the weights.
+on_before_zero_grad(self, optimizer): runs just after the weights are updated. I believe this repo uses it for EMA updates, but check.
+on_save_checkpoint(self, checkpoint) and on_load_checkpoint(self, checkpoint): let you add to or edit the saved file. This is how things like the discriminator and EMA copy end up in the checkpoint, which ties back to your earlier question about checkpoint size.
+setup and on_train_epoch_end: run at the start of training and at the end of each pass through the data.
+Manual optimization: why the autoencoder wrapper looks different
+
+By default, Lightning does the backward pass and optimizer step for you. That breaks down for GAN-style training, where two networks (the autoencoder and its discriminator) take turns being updated with different losses.
+
+For this, a module sets self.automatic_optimization = False. Then inside training_step you do the steps yourself:
+
+Get your optimizers with self.optimizers().
+Compute a loss.
+Call self.manual_backward(loss) instead of loss.backward() (so Lightning can still handle things like mixed precision).
+Call opt.step() and opt.zero_grad().
+
+In this mode, what training_step returns matters much less, because you’ve already done the update. And configure_optimizers returns several optimizers, one per network. I expect the autoencoder training wrapper to work this way and the diffusion wrapper to use the automatic mode, but I haven’t seen your copy, so verify.
+
+What Lightning does that you don’t write
+
+Moving data and the model to the right device, switching between training and evaluation mode, mixed precision, gradient accumulation, running on several GPUs, saving checkpoints at intervals, and calling callbacks. Callbacks are separate objects that plug into the loop; in this repo, they produce the listening examples during training and manage checkpoints.
+
+How it maps to what you’ll read
+
+When you open the inpaint wrapper, expect this pattern:
+
+__init__: takes the diffusion model (and the autoencoder as a frozen pretransform), makes the EMA copy, and stores settings like max_mask_segments.
+training_step: unpacks the batch, encodes the audio, builds the mask, adds noise, runs the model, and returns the loss. This is the method I suggested studying most closely.
+configure_optimizers: sets up the optimizer and learning-rate schedule from the training config.
+A hook for EMA updates.
+
+A useful reading trick is to read training_step first and ignore everything else on the first pass. It’s the part that defines what the model learns. Once you understand it, the other methods are mostly bookkeeping.
+
+If you paste the inpaint wrapper’s training_step, I can annotate it line by line in plain terms.

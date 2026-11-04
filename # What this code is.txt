@@ -1,0 +1,81 @@
+# What this code is
+
+This is a **PyTorch Lightning training wrapper for an audio autoencoder**, trained GAN-style. The autoencoder compresses audio into latents (`encode`) and reconstructs audio from them (`decode`). The wrapper doesn't define the model. It defines *how to train it*: which losses to use, how to alternate between generator and discriminator updates, how to log, and how to keep an EMA copy of the weights.
+
+It also includes many optional experimental features (distillation, JEPA, contrastive, diffusion-on-latents, and so on), which is why it looks so big. Most of those are switched on or off by keys in `loss_config`.
+
+## The mental model
+
+```
+audio → encoder → latents → decoder → reconstructed audio
+                     │                       │
+                     └─ auxiliary losses      └─ compared to the original by:
+                        (jepa, contrastive,      spectral loss, adversarial loss,
+                         diffusion, chroma…)     feature matching, L1/L2, etc.
+```
+
+## `__init__`: it's a builder
+
+It reads top to bottom as a series of independent "if this key is in the config, build this thing" blocks:
+
+1. **Store settings** (warmup, lr, grad clipping, teacher model, and so on).
+2. **Default configs** if none were given (AdamW optimizers, multi-resolution STFT loss, Encodec discriminator).
+3. **Optional modules**, each gated by a config key: contrastive critic, JEPA, diffusion-on-latents, discriminator (chosen by `type`).
+4. **`self.gen_loss_modules`**, a list that every block appends to. Each entry is a small loss object like `ValueLoss(key='loss_adv', weight=...)` or `AuralossLoss(..., target_key='reals', input_key='decoded')`. These are wrapped at the end in `MultiLoss`.
+5. **`self.disc_loss_modules`**, a much shorter list for the discriminator.
+6. **EMA** of the autoencoder weights, plus eval metrics.
+
+**Key insight:** the loss modules refer to tensors *by string key* (`'reals'`, `'decoded'`, `'latents'`, `'teacher_latents'`). Those keys are looked up in a dictionary called `loss_info`, which `training_step` fills. You can think of `loss_info` as a shared blackboard. `training_step` writes to it, and the loss modules read from it.
+
+## `training_step`: the core
+
+It does the following, in order:
+
+1. **Prep the batch.** Fix shapes, optionally add synthetic chirps, randomly zero a few examples ("silence → silence"), and optionally zero out tail patches.
+2. **Decide whether this is a discriminator step or a generator step.** `use_disc` is true on odd `global_step`s, once warmup allows it. So the two alternate.
+3. **Encode.** Gradients are disabled when it's a disc step (nothing upstream needs to learn), when fine-tuning the decoder only, or when the encoder is frozen after warmup.
+4. **Auxiliary losses on the latents** (only when the encoder is training): chroma/ILD "semantic regressors", contrastive, JEPA, and diffusion. During their warmup periods they use `latents.detach()`, so the auxiliary model learns without pushing gradients back into the autoencoder yet.
+5. **Teacher encode** (if distilling), then optional latent masking for noise robustness.
+6. **Decode.** Again with no gradients on disc steps.
+7. **Teacher cross-decoding** (if distilling): student latents through the teacher's decoder, and the reverse.
+8. **Run the discriminator** to get `loss_dis`, `loss_adv`, and `feature_matching_distance` into `loss_info`.
+9. **Backward and step.** On disc steps it uses `losses_disc` and `opt_disc`. On gen steps it uses `losses_gen` and `opt_gen`, then updates the EMA every 10 steps and steps the scheduler.
+10. **Log** everything.
+
+## Other methods
+
+- **`configure_optimizers`** collects the parameters for each optimizer. Note that if `use_generative_loss` is on, the diffusion model's parameters get added to the *discriminator* optimizer, which looks intentional but is easy to miss.
+- **`validation_step` / `on_validation_epoch_end`** compute eval metrics with the EMA model and average them correctly across GPUs, by gathering sums and counts rather than averaging the per-rank averages.
+- **`export_model`** saves the EMA weights if they exist.
+
+## Things worth noticing
+
+- `automatic_optimization = False`, so the code calls `manual_backward`, clips gradients, and steps the optimizers itself. That's needed for the alternating GAN scheme.
+- `set_requires_grad(self.discriminator, bool(use_disc))`: on generator steps the discriminator is still *run* (for adversarial and feature-matching loss) but its weights don't accumulate gradients.
+- The `scaler.get_scale()` logic multiplies the clip value by the AMP loss scale, because gradients are still scaled at the time of clipping.
+
+---
+
+# General strategies for breaking down big code
+
+**1. Start with the shape, not the details.** Read the class and method *names* first. Here: `__init__`, `configure_optimizers`, `training_step`, `validation_step`, `export_model`. That already tells you "training wrapper."
+
+**2. Find the main path and skim the branches.** Identify what happens when everything is default, and treat every `if self.use_xyz` as a side quest to revisit later. In this file, the main path is encode, decode, spectral loss, discriminator, backward.
+
+**3. Follow the data.** Pick the central object (here the `loss_info` dict, or the `latents` tensor) and trace where it's created, modified, and consumed. Writing `reals → encoder_input → latents → decoded` on paper is often enough.
+
+**4. Collapse sections into one-line summaries.** Go through the code and write a comment-like label for each block ("build discriminator", "teacher cross-decoding"). If a block takes you more than a sentence to label, it's probably two blocks.
+
+**5. Know the framework conventions.** Half of the confusion here goes away if you know what Lightning does (`training_step`, `configure_optimizers`, manual optimization) and what a GAN training loop looks like. Reading the framework's docs for the 3–4 hooks involved is often faster than staring at the code.
+
+**6. Separate "what" from "why".** First work out what each line does, then, as a second pass, ask why it's there. Odd-looking details like `.detach()` during warmup or the `torch.no_grad() if use_disc else nullcontext()` pattern make sense once you see the larger purpose.
+
+**7. Use tools rather than your head.** Add `print(tensor.shape)` calls, step through with a debugger on a tiny batch, or run a single `training_step` with a toy model. Seeing real shapes and values beats inference.
+
+**8. Mark unknowns and move on.** If you hit `calc_update_to_weight_ratio` or `LatentJEPA`, write "diagnostic" or "aux loss" next to it and continue. Come back only if it matters for your goal.
+
+**9. Know your goal.** "Understand everything" is a huge task. "Understand how the discriminator and generator alternate" or "figure out where to add my own loss" is a small one, and it tells you which 10% of the code to read closely.
+
+**10. Check your understanding by explaining it.** Try to describe the flow in plain language, or draw it. Wherever you stumble is where to look again. Or, as you're doing now, ask someone (or something) to check your understanding.
+
+If you'd like, I can go deeper on any one part, such as the generator/discriminator alternation, the warmup logic, the distillation losses, or how `MultiLoss` and the string keys work together.

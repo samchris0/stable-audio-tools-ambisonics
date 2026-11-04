@@ -1,0 +1,56 @@
+Here’s a reading order that follows the path of your data, from raw files to trained model to generated audio. File names are from memory, so adjust them if your copy is organized differently. If a file doesn’t exist, search for the class name instead.
+
+Before you read any code
+
+Read the repo’s README and its config documentation (a docs folder or the README sections on model config and dataset config). The whole package is driven by JSON files, so the configs tell you what the code is supposed to do. Also open one example config for each model type you’ll use (autoencoder, then the inpainting diffusion model) and read it line by line. Every setting in it points to a place in the code.
+
+Stage 1: The front door
+
+train.py (about 15 minutes). This is the script you launch. You’re looking for the order of events: it reads the two config files, builds the data loader, builds the model, wraps the model for training, and hands everything to PyTorch Lightning. Questions to answer:
+
+Which function turns the dataset config into a data loader?
+Which function turns the model config into a model, and which into a training wrapper?
+Where does the autoencoder checkpoint get loaded for the second-stage diffusion training?
+Stage 2: Data in
+
+data/dataset.py and data/utils.py. You’ve seen enough of this to read it quickly. Focus on SampleDataset (what __getitem__ returns), create_dataloader_from_config (where you’d register your new dataset type), and the small audio-transform classes in utils.py (random cropping, stereo/mono forcing, volume and phase augmentation). These show you the existing pattern for augmentations that you’ll copy for rotation and drift.
+
+Stage 3: The autoencoder (the compressor)
+models/factory.py: how a model config becomes a model object. Short and useful.
+models/autoencoders.py: the file you shared. You now know its overall shape. Next time through, trace one concrete path: AudioAutoencoder.encode, then the Oobleck encoder, then back through decode.
+models/bottleneck.py: the “squeeze point” in the middle. The common one is a VAE-style bottleneck that adds a little randomness and a penalty so latents stay well-behaved. Understand what latent_dim means here and where the penalty comes from.
+models/pretransforms.py: how a finished autoencoder gets packaged so the diffusion model can use it. This is the bridge between your two training stages.
+training/autoencoders.py and the losses folder under training/: how the autoencoder is trained. You’ll see the reconstruction losses (comparing spectrograms of original and rebuilt audio) and the discriminator used for the adversarial part you originally asked about. This is also where I’d expect stereo assumptions to show up, so read it with “what breaks with 4 channels?” in mind.
+models/discriminators.py: only if you want to design your own multichannel discriminator later.
+Stage 4: The diffusion model (the generator)
+models/diffusion.py: the wrappers that make different network types look the same to the training code. Pay special attention to the wrapper for the transformer-based model (DiTWrapper) and to how extra input like input_concat_cond is handled, since that’s the inpainting channel.
+models/dit.py and models/transformer.py: the actual network. You don’t need to understand every line of attention code. Read dit.py for how inputs are laid out (noisy latent plus extra concatenated channels, time step, conditioning) and skim the transformer blocks for what knobs exist.
+training/diffusion.py, the inpaint wrapper you found: read it closely. This is the heart of your project. Questions to answer:
+How does it create the mask, and what controls gap size and number?
+What gets noised, and what does the model have to predict?
+What exactly is concatenated onto the model’s input?
+Where does the autoencoder get called?
+What is the loss, and where is it computed?
+training/factory.py: how the model type in the config picks this wrapper and which config settings it reads.
+Stage 5: Generating audio
+inference/sampling.py: the loops that turn noise into audio step by step (sample_v, build_schedule, and any newer samplers). You’ll want to understand what a “step count” and a “schedule” mean here, because they affect quality and speed.
+inference/generation.py: look for the inpainting generation function. This is what you’d call to complete a loop. Check how it builds the mask, whether you can pass your own, and how it stitches the result back together.
+inference/utils.py: audio preparation helpers. Check how it treats channel counts (the prepare_audio function I flagged earlier).
+Optional and skim-only
+models/conditioners.py: this is how text, timing, and number inputs get fed to the model. Skim it unless you decide to give the model the gap length as an explicit input, in which case look at how number conditioners work.
+interface/gradio.py and the demo callbacks: the web interface and the listening examples saved during training. Worth reading only when they break on 4 channels.
+unwrap_model.py: the script for stripping a checkpoint down to just the model.
+Probably skip
+
+The language model code, the wavelet code, the DAC and other codec wrappers, and the older unconditional diffusion pieces. None of them are on your path.
+
+How to read without getting lost
+Follow one batch. Pick a single training example and track its shape at every step: audio in, latent after the autoencoder, noisy latent, model input with the mask attached, model output, loss. Write the shapes down. If you can fill in that table, you understand the pipeline.
+Print as you go. Run a tiny training job (a few clips, tiny batch, few steps) with print(x.shape) calls at the stages above. Seeing real numbers beats reading.
+Read configs and code together. For each setting you meet in an example config, find the line of code that uses it.
+Keep a list of 2-channel assumptions. As you read, note every place that assumes mono or stereo. That list becomes your to-do for the 4-channel conversion.
+A practical first exercise
+
+Before changing anything, train the stock autoencoder for a few hundred steps on any small stereo dataset, then do the same for the inpainting diffusion model. You’re not trying to get good audio. You’re confirming the whole chain runs end to end, so when you start modifying things, you know any breakage is yours.
+
+Would you like me to suggest what to look for first in the inpaint wrapper once you’ve opened it? If you paste it here, I can walk through it with you in plain terms.
